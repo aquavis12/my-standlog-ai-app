@@ -8,14 +8,30 @@ One CloudFormation template. No SAM CLI, no build step, no packaging.
 
 ## Architecture
 
-```
-Browser — frontend/index.html hosted on AWS Amplify (or open locally)
-   │
-   ▼
-Amazon API Gateway (HTTP API, CORS)
-   ├── /entries  GET|POST|DELETE ──► Lambda (inline) ──► DynamoDB (single table, on-demand)
-   └── /generate POST ────────────► Lambda (inline) ─┬► DynamoDB (read range)
-                                                     └► Amazon Bedrock — Amazon Nova Lite (Converse API)
+```mermaid
+flowchart TB
+    U([User]) -->|HTTPS| FE
+
+    subgraph AMP["AWS Amplify Hosting — auto-deploy from GitHub"]
+        FE["frontend/index.html<br/>static, no build step"]
+    end
+
+    FE -->|"fetch + CORS"| API
+
+    subgraph CFN["CloudFormation stack — template.yml (us-east-1)"]
+        API["Amazon API Gateway<br/>HTTP API"]
+        L1["AWS Lambda — standlog-entries<br/>Python 3.12 · arm64 · inline code"]
+        L2["AWS Lambda — standlog-generate<br/>Python 3.12 · arm64 · inline code"]
+        DB[("Amazon DynamoDB<br/>single table · on-demand<br/>pk=USER#default<br/>sk=ENTRY#&lt;iso-ts&gt;")]
+
+        API -->|"GET / POST /entries<br/>DELETE /entries/{sk}"| L1
+        API -->|"POST /generate"| L2
+        L1 <--> DB
+        L2 -->|"range read (BETWEEN on sk)"| DB
+    end
+
+    L2 -->|"Converse API"| BR["Amazon Bedrock<br/>Amazon Nova Lite<br/>us.amazon.nova-lite-v1:0"]
+    GR["Bedrock Guardrail<br/>PII masking (optional,<br/>GuardrailId stack parameter)"] -.-> BR
 ```
 
 **Why these choices**
