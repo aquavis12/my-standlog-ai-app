@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  StandLog - AI Work Journal / Standup Generator.
+  Pure CloudFormation (no SAM) - deploy by uploading this file in the console.
+  Region: us-east-1 recommended (Amazon Nova Lite on Bedrock).
+  Stack: HTTP API + 2 inline Lambda functions + DynamoDB + Bedrock.
+
+Parameters:
+  BedrockModelId:
+    Type: String
+    Default: us.amazon.nova-lite-v1:0
+    Description: Bedrock model ID used for generation (Converse API).
+  TableName:
+    Type: String
+    Default: standlog-entries
+  CorsAllowOrigin:
+    Type: String
+    Default: "*"
+    Description: Lock this to your site URL in production.
+  GuardrailId:
+    Type: String
+    Default: ""
+    Description: >
+      Optional Bedrock Guardrail ID. Create the guardrail in the Bedrock
+      console, then update the stack with its ID. Leave empty to disable.
+  GuardrailVersion:
+    Type: String
+    Default: DRAFT
+    Description: Guardrail version to apply (DRAFT or a published version number).
+
+Resources:
+
+  # ------------------------------------------------------------ DynamoDB
+  EntriesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+  # ------------------------------------------------------------ IAM
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: standlog-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt EntriesTable.Arn
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/*
+                  - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+              - Effect: Allow
+                Action: bedrock:ApplyGuardrail
+                Resource: !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:guardrail/*
+
+  # ------------------------------------------------------------ Lambda: entries CRUD
+  EntriesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: standlog-entries
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EntriesTable
+      Code:
+        ZipFile: |
+          import json, os, uuid
+          from datetime import datetime, timezone
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          PK = "USER#default"
+          KINDS = {"task", "blocker", "win", "note"}
+
+          def resp(code, body):
+              return {"statusCode": code,
+                      "headers": {"content-type": "application/json"},
+                      "body": json.dumps(body, default=str)}
+
+          def list_entries(p):
+              kc = Key("pk").eq(PK)
+              s, e = p.get("start"), p.get("end")
+              if s and e:
+                  kc &= Key("sk").between(f"ENTRY#{s}", f"ENTRY#{e}T23:59:59Z~")
+              elif s:
+                  kc &= Key("sk").gte(f"ENTRY#{s}")
+              else:
+                  kc &= Key("sk").begins_with("ENTRY#")
+              r = table.query(KeyConditionExpression=kc,
+                              ScanIndexForward=False, Limit=200)
+              return resp(200, {"entries": r.get("Items", [])})
+
+          def create(b):
+              text = (b.get("text") or "").strip()
+              if not text:
+                  return resp(400, {"error": "Field 'text' is required."})
+              if len(text) > 2000:
+                  return resp(400, {"error": "Max 2000 characters."})
+              kind = b.get("kind", "task")
+              kind = kind if kind in KINDS else "note"
+              tags = b.get("tags") or []
+              tags = [str(t)[:50] for t in tags][:10] if isinstance(tags, list) else []
+              ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+              item = {"pk": PK, "sk": f"ENTRY#{ts}#{uuid.uuid4().hex[:6]}",
+                      "text": text, "kind": kind, "tags": tags, "created_at": ts}
+              table.put_item(Item=item)
+              return resp(201, {"entry": item})
+
+          def handler(event, _ctx):
+              m = event.get("requestContext", {}).get("http", {}).get("method", "")
+              path = event.get("rawPath", "")
+              try:
+                  if m == "GET" and path == "/entries":
+                      return list_entries(event.get("queryStringParameters") or {})
+                  if m == "POST" and path == "/entries":
+                      return create(json.loads(event.get("body") or "{}"))
+                  if m == "DELETE" and path.startswith("/entries/"):
+                      sk = event.get("pathParameters", {}).get("sk", "")
+                      if not sk.startswith("ENTRY#"):
+                          return resp(400, {"error": "Invalid entry key."})
+                      table.delete_item(Key={"pk": PK, "sk": sk})
+                      return resp(200, {"deleted": sk})
+                  return resp(404, {"error": "Not found"})
+              except json.JSONDecodeError:
+                  return resp(400, {"error": "Body must be valid JSON."})
+              except Exception as exc:
+                  print(f"ERROR: {exc}")
+                  return resp(500, {"error": "Internal error"})
+
+  # ------------------------------------------------------------ Lambda: Bedrock generate
+  GenerateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: standlog-generate
+      Runtime: python3.12
+      Architectures: [arm64]
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref EntriesTable
+          MODEL_ID: !Ref BedrockModelId
+          GUARDRAIL_ID: !Ref GuardrailId
+          GUARDRAIL_VERSION: !Ref GuardrailVersion
+      Code:
+        ZipFile: |
+          import json, os
+          from datetime import datetime, timezone
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE_NAME"])
+          bedrock = boto3.client("bedrock-runtime")
+          MODEL_ID = os.environ["MODEL_ID"]
+          PK = "USER#default"
+
+          PROMPTS = {
+              "standup": ("You write daily standup updates for a cloud consultant. "
+                  "From the journal entries below, write a concise standup with "
+                  "sections 'Yesterday/Done', 'Today/Next', 'Blockers'. Group "
+                  "related items, drop noise, under 150 words. Plain text, "
+                  "hyphen bullets, no preamble."),
+              "weekly": ("You write weekly work summaries for a cloud consultant. "
+                  "From the journal entries below, write sections 'Highlights', "
+                  "'Delivered', 'In progress', 'Risks & blockers'. Merge "
+                  "duplicates, under 250 words, tone suitable for a manager. "
+                  "Plain text, no preamble."),
+              "ticket_reply": ("You draft client-facing ticket reply emails for an "
+                  "AWS consulting engineer. From the journal entries below, draft "
+                  "a professional ticket update: brief context, work performed, "
+                  "findings, next steps. Do not invent technical details that are "
+                  "not in the entries. Under 220 words. Start with 'Subject: ...' "
+                  "then the body. No preamble."),
+          }
+
+          def resp(code, body):
+              return {"statusCode": code,
+                      "headers": {"content-type": "application/json"},
+                      "body": json.dumps(body, default=str)}
+
+          def handler(event, _ctx):
+              try:
+                  b = json.loads(event.get("body") or "{}")
+              except json.JSONDecodeError:
+                  return resp(400, {"error": "Body must be valid JSON."})
+              mode = b.get("mode", "standup")
+              if mode not in PROMPTS:
+                  return resp(400, {"error": f"mode must be one of {sorted(PROMPTS)}"})
+              today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+              start, end = b.get("start") or today, b.get("end") or today
+              tag, aud = b.get("tag"), (b.get("audience") or "").strip()
+
+              kc = Key("pk").eq(PK) & Key("sk").between(
+                  f"ENTRY#{start}", f"ENTRY#{end}T23:59:59Z~")
+              items = table.query(KeyConditionExpression=kc, Limit=300).get("Items", [])
+              if tag:
+                  items = [i for i in items if tag in (i.get("tags") or [])]
+              if not items:
+                  return resp(200, {"output": "No journal entries found for that "
+                                    "range - log a few notes first.", "entry_count": 0})
+
+              lines = []
+              for it in items:
+                  tg = ",".join(it.get("tags") or [])
+                  lines.append(f"- ({it.get('created_at','?')}) "
+                               f"[{it.get('kind','note')}]"
+                               f"{' ['+tg+']' if tg else ''} {it.get('text','')}")
+              prompt = (f"Date range: {start} to {end}\n"
+                        + (f"Intended audience: {aud}\n" if aud else "")
+                        + "Journal entries:\n" + "\n".join(lines))
+
+              kwargs = dict(
+                  modelId=MODEL_ID,
+                  system=[{"text": PROMPTS[mode]}],
+                  messages=[{"role": "user", "content": [{"text": prompt}]}],
+                  inferenceConfig={"maxTokens": 800, "temperature": 0.3})
+              gid = os.environ.get("GUARDRAIL_ID", "")
+              if gid:
+                  kwargs["guardrailConfig"] = {
+                      "guardrailIdentifier": gid,
+                      "guardrailVersion": os.environ.get("GUARDRAIL_VERSION", "DRAFT")}
+              r = bedrock.converse(**kwargs)
+              out = "".join(c.get("text", "")
+                            for c in r["output"]["message"]["content"]).strip()
+              return resp(200, {"output": out, "entry_count": len(items),
+                                "mode": mode,
+                                "stop_reason": r.get("stopReason", "")})
+
+  # ------------------------------------------------------------ HTTP API
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: standlog-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref CorsAllowOrigin]
+        AllowMethods: [GET, POST, DELETE, OPTIONS]
+        AllowHeaders: [content-type]
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  EntriesIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt EntriesFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GenerateIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GenerateFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  RouteListEntries:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: GET /entries
+      Target: !Sub integrations/${EntriesIntegration}
+
+  RouteCreateEntry:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /entries
+      Target: !Sub integrations/${EntriesIntegration}
+
+  RouteDeleteEntry:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: DELETE /entries/{sk}
+      Target: !Sub integrations/${EntriesIntegration}
+
+  RouteGenerate:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /generate
+      Target: !Sub integrations/${GenerateIntegration}
+
+  EntriesInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EntriesFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+  GenerateInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GenerateFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for the StandLog API (paste into the frontend settings)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  TableNameOut:
+    Value: !Ref EntriesTable
