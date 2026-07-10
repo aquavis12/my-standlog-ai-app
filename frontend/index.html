@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>StandLog — AI Work Journal</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wdth,wght@75..100,500..800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#EDF1F3; --card:#FFFFFF; --ink:#17242F; --ink-soft:#4A5A66;
+    --line:#C9D4DA; --amber:#B85E08; --amber-soft:#FBEBDD;
+    --moss:#3E6B4F; --moss-soft:#E4EEE7; --red:#A33B2E; --red-soft:#F6E4E1;
+    --blue:#2C5D8A; --blue-soft:#E2ECF5;
+    --mono:'IBM Plex Mono',ui-monospace,monospace;
+    --disp:'Archivo',system-ui,sans-serif;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{font-size:16px}
+  body{
+    background:var(--paper); color:var(--ink);
+    font-family:var(--disp); line-height:1.5; min-height:100vh;
+    background-image:linear-gradient(var(--line) 1px,transparent 1px);
+    background-size:100% 2.5rem; background-attachment:fixed;
+  }
+  .wrap{max-width:70rem;margin:0 auto;padding:1.5rem 1.25rem 4rem}
+  header{display:flex;align-items:baseline;gap:1rem;flex-wrap:wrap;padding:1rem 0 1.75rem}
+  header h1{font-family:var(--disp);font-weight:800;font-stretch:80%;font-size:1.9rem;letter-spacing:-.02em}
+  header h1 .tail{color:var(--amber)}
+  header .sub{font-family:var(--mono);font-size:.78rem;color:var(--ink-soft)}
+  .cols{display:grid;grid-template-columns:1fr 1fr;gap:1.25rem}
+  @media(max-width:860px){.cols{grid-template-columns:1fr}}
+  .panel{background:var(--card);border:1px solid var(--line);border-radius:.6rem;padding:1.15rem;box-shadow:0 1px 0 rgba(23,36,47,.06)}
+  .panel h2{font-size:.8rem;font-weight:700;text-transform:uppercase;letter-spacing:.09em;color:var(--ink-soft);margin-bottom:.9rem}
+  textarea,input,select{
+    width:100%;font-family:var(--mono);font-size:.85rem;color:var(--ink);
+    border:1px solid var(--line);border-radius:.4rem;padding:.55rem .65rem;background:#FAFCFD;
+  }
+  textarea{resize:vertical;min-height:4.5rem}
+  textarea:focus,input:focus,select:focus{outline:2px solid var(--amber);outline-offset:1px;border-color:transparent}
+  .row{display:flex;gap:.6rem;margin-top:.6rem;flex-wrap:wrap}
+  .row>*{flex:1;min-width:8rem}
+  button{
+    font-family:var(--disp);font-weight:700;font-size:.85rem;cursor:pointer;
+    border:1px solid var(--ink);border-radius:.4rem;padding:.55rem 1rem;
+    background:var(--ink);color:#fff;transition:transform .05s ease;
+  }
+  button:hover{transform:translateY(-1px)} button:active{transform:none}
+  button.ghost{background:transparent;color:var(--ink)}
+  button.amber{background:var(--amber);border-color:var(--amber)}
+  button:disabled{opacity:.5;cursor:wait;transform:none}
+  button:focus-visible{outline:3px solid var(--amber);outline-offset:2px}
+  /* log stream — the signature */
+  .stream{margin-top:.4rem;max-height:26rem;overflow-y:auto;font-family:var(--mono);font-size:.8rem}
+  .entry{display:grid;grid-template-columns:5.4rem 4.6rem 1fr auto;gap:.6rem;align-items:start;
+    padding:.5rem .25rem;border-bottom:1px dashed var(--line)}
+  .entry .ts{color:var(--ink-soft);font-size:.72rem;padding-top:.15rem}
+  .badge{font-size:.66rem;font-weight:600;text-transform:uppercase;letter-spacing:.05em;
+    padding:.15rem .4rem;border-radius:.25rem;text-align:center}
+  .badge.task{background:var(--blue-soft);color:var(--blue)}
+  .badge.blocker{background:var(--red-soft);color:var(--red)}
+  .badge.win{background:var(--moss-soft);color:var(--moss)}
+  .badge.note{background:var(--amber-soft);color:var(--amber)}
+  .entry .txt .tags{color:var(--ink-soft);font-size:.7rem}
+  .entry .del{background:none;border:none;color:var(--ink-soft);font-size:.9rem;padding:.1rem .3rem}
+  .entry .del:hover{color:var(--red)}
+  .empty{padding:1.5rem .5rem;color:var(--ink-soft);font-family:var(--mono);font-size:.8rem}
+  /* output */
+  .out{margin-top:.8rem;background:#FAFCFD;border:1px solid var(--line);border-radius:.4rem;
+    padding:.9rem;font-family:var(--mono);font-size:.82rem;white-space:pre-wrap;min-height:8rem}
+  .out.loading{color:var(--ink-soft)}
+  .outbar{display:flex;justify-content:space-between;align-items:center;margin-top:.5rem}
+  .meta{font-family:var(--mono);font-size:.72rem;color:var(--ink-soft)}
+  /* settings */
+  details.cfg{margin-top:1.25rem;font-family:var(--mono);font-size:.78rem;color:var(--ink-soft)}
+  details.cfg summary{cursor:pointer}
+  details.cfg .row{max-width:34rem}
+  .toast{position:fixed;bottom:1.2rem;left:50%;transform:translateX(-50%);
+    background:var(--ink);color:#fff;font-family:var(--mono);font-size:.78rem;
+    padding:.5rem .9rem;border-radius:.4rem;opacity:0;pointer-events:none;transition:opacity .2s}
+  .toast.show{opacity:1}
+  @media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>stand<span class="tail">log</span></h1>
+    <span class="sub">// capture the day, generate the update</span>
+  </header>
+
+  <div class="cols">
+    <!-- CAPTURE + STREAM -->
+    <section class="panel">
+      <h2>Log an entry</h2>
+      <textarea id="text" maxlength="2000" placeholder="e.g. Tuned CW CPU alarms on 27 servers — moved DEV/UAT to sustained-breach eval"></textarea>
+      <div class="row">
+        <select id="kind" aria-label="Entry kind">
+          <option value="task">task</option>
+          <option value="blocker">blocker</option>
+          <option value="win">win</option>
+          <option value="note">note</option>
+        </select>
+        <input id="tags" placeholder="tags, comma-separated" aria-label="Tags">
+        <button id="add" class="amber">Log it</button>
+      </div>
+
+      <h2 style="margin-top:1.5rem">Today's stream</h2>
+      <div class="stream" id="stream"><div class="empty">Nothing logged yet. The stream fills as you work.</div></div>
+    </section>
+
+    <!-- GENERATE -->
+    <section class="panel">
+      <h2>Generate</h2>
+      <div class="row">
+        <select id="mode" aria-label="Output mode">
+          <option value="standup">Daily standup</option>
+          <option value="weekly">Weekly summary</option>
+          <option value="ticket_reply">Client ticket reply</option>
+        </select>
+        <input id="start" type="date" aria-label="Start date">
+        <input id="end" type="date" aria-label="End date">
+      </div>
+      <div class="row">
+        <input id="tag" placeholder="filter by tag (optional)" aria-label="Tag filter">
+        <input id="aud" placeholder="audience (optional, e.g. client contact)" aria-label="Audience">
+        <button id="gen">Generate</button>
+      </div>
+      <div class="out" id="out">Output appears here.</div>
+      <div class="outbar">
+        <span class="meta" id="meta"></span>
+        <button class="ghost" id="copy">Copy</button>
+      </div>
+    </section>
+  </div>
+
+  <details class="cfg">
+    <summary>API settings</summary>
+    <div class="row">
+      <input id="api" placeholder="https://xxxx.execute-api.region.amazonaws.com">
+      <button class="ghost" id="saveApi">Save endpoint</button>
+    </div>
+  </details>
+</div>
+<div class="toast" id="toast" role="status"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let API = '';
+try { API = localStorage.getItem('standlog_api') || ''; } catch(e) {}
+// Allow a pre-configured share link: https://<amplify-domain>/?api=https://xxx.execute-api...
+const qsApi = new URLSearchParams(location.search).get('api');
+if (qsApi) {
+  API = qsApi.trim().replace(/\/$/,'');
+  try { localStorage.setItem('standlog_api', API); } catch(e) {}
+}
+$('api').value = API;
+
+const today = new Date().toISOString().slice(0,10);
+$('start').value = today; $('end').value = today;
+
+function toast(msg){
+  const t = $('toast'); t.textContent = msg; t.classList.add('show');
+  setTimeout(()=>t.classList.remove('show'), 2200);
+}
+function needApi(){
+  if(!API){ toast('Set your API endpoint first (API settings below).'); return true; }
+  return false;
+}
+$('saveApi').onclick = () => {
+  API = $('api').value.trim().replace(/\/$/,'');
+  try { localStorage.setItem('standlog_api', API); } catch(e) {}
+  toast('Endpoint saved.'); loadEntries();
+};
+
+function esc(s){ const d=document.createElement('div'); d.textContent=s; return d.innerHTML; }
+
+async function loadEntries(){
+  if(!API) return;
+  try{
+    const r = await fetch(`${API}/entries?start=${today}&end=${today}`);
+    const data = await r.json();
+    renderStream(data.entries || []);
+  }catch(e){ toast('Could not reach API.'); }
+}
+
+function renderStream(items){
+  const s = $('stream');
+  if(!items.length){ s.innerHTML = '<div class="empty">Nothing logged yet. The stream fills as you work.</div>'; return; }
+  s.innerHTML = items.map(it => {
+    const time = (it.created_at||'').slice(11,16) || '--:--';
+    const tags = (it.tags||[]).length ? `<div class="tags">#${it.tags.join(' #')}</div>` : '';
+    return `<div class="entry">
+      <span class="ts">${time} UTC</span>
+      <span class="badge ${esc(it.kind||'note')}">${esc(it.kind||'note')}</span>
+      <div class="txt">${esc(it.text||'')}${tags}</div>
+      <button class="del" data-sk="${esc(it.sk)}" aria-label="Delete entry">×</button>
+    </div>`;
+  }).join('');
+  s.querySelectorAll('.del').forEach(b => b.onclick = async () => {
+    await fetch(`${API}/entries/${encodeURIComponent(b.dataset.sk)}`, {method:'DELETE'});
+    loadEntries();
+  });
+}
+
+$('add').onclick = async () => {
+  if(needApi()) return;
+  const text = $('text').value.trim();
+  if(!text){ toast('Write something first.'); return; }
+  $('add').disabled = true;
+  try{
+    const tags = $('tags').value.split(',').map(t=>t.trim()).filter(Boolean);
+    const r = await fetch(`${API}/entries`, {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({text, kind: $('kind').value, tags})
+    });
+    if(r.ok){ $('text').value=''; $('tags').value=''; loadEntries(); }
+    else toast('Save failed.');
+  }catch(e){ toast('Could not reach API.'); }
+  $('add').disabled = false;
+};
+
+$('gen').onclick = async () => {
+  if(needApi()) return;
+  const out = $('out');
+  out.classList.add('loading'); out.textContent = 'Reading entries and drafting…';
+  $('gen').disabled = true; $('meta').textContent = '';
+  try{
+    const r = await fetch(`${API}/generate`, {
+      method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({
+        mode: $('mode').value, start: $('start').value, end: $('end').value,
+        tag: $('tag').value.trim() || undefined,
+        audience: $('aud').value.trim() || undefined
+      })
+    });
+    const data = await r.json();
+    out.textContent = data.output || data.error || 'No output.';
+    if(data.entry_count !== undefined) $('meta').textContent = `${data.entry_count} entries · ${data.mode||''}`;
+  }catch(e){ out.textContent = 'Could not reach API.'; }
+  out.classList.remove('loading'); $('gen').disabled = false;
+};
+
+$('copy').onclick = async () => {
+  try{ await navigator.clipboard.writeText($('out').textContent); toast('Copied.'); }
+  catch(e){ toast('Copy failed — select the text manually.'); }
+};
+
+loadEntries();
+</script>
+</body>
+</html>
